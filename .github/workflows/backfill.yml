@@ -1,0 +1,37 @@
+name: backfill
+on:
+  workflow_dispatch:
+    inputs:
+      delay:
+        description: "Seconds between requests"
+        default: "1.0"
+      limit:
+        description: "Stop after N new fetches (0 = all)"
+        default: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -r requirements.txt
+      - name: Harvest detail pages
+        run: python scripts/harvest_qol.py --delay "${{ inputs.delay }}" --limit "${{ inputs.limit }}"
+      - name: Parse the corpus
+        run: python scripts/parse_qol.py
+      - name: Score the parser against fixtures
+        continue-on-error: true
+        run: python scripts/test_parser.py
+      - name: Commit
+        run: |
+          git config user.name  "prefsdb-bot"
+          git config user.email "prefsdb-bot@users.noreply.github.com"
+          git add data/raw/qol_pages.jsonl data/facts.csv
+          git diff --staged --quiet || git commit -m "backfill: harvest + parse QOL detail pages"
+          git push
