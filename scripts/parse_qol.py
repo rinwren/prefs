@@ -39,7 +39,7 @@ FIELDS = ["symbol", "found", "security_name", "security_type", "structure", "par
           "coupon_pct", "par", "annual_amount", "call_date", "call_price", "maturity_date",
           "reference_rate", "float_spread_bps", "float_floor_pct", "reset_date", "ratings",
           "distribution_dates", "qol_as_of", "previous_ticker", "previous_ticker_changed",
-          "redeemed", "parse_flags", "fetched_at"]
+          "redeemed", "qol_table_raw", "parse_flags", "fetched_at"]
 
 # --- zone extraction ------------------------------------------------------
 # The security block starts at the LABELLED ticker line ("Ticker Symbol:" with a
@@ -51,6 +51,11 @@ DESC_RE = re.compile(r"QUANTUMONLINE\.COM SECURITY DESCRIPTION:\s*(.*?)(?=\n(?:S
                      re.S | re.I)
 DESC_FALLBACK = re.compile(r"QUANTUMONLINE\.COM SECURITY DESCRIPTION:\s*(.{50,4000})", re.S | re.I)
 TABLE_RE = re.compile(r"\n15%\s*\n\s*Tax Rate\s*\n(.*)", re.S)
+# The table ends where the page moves on. Without this, the ratings cell absorbs
+# the parent-company link, the IPO line and any NOTE that follows.
+TABLE_END = re.compile(r"^\s*(Go to Parent Company|IPO\s*-|Link to IPO|"
+                       r"Previous Ticker Symbol:|Market Value|NOTE:|Find All Related)",
+                       re.I | re.M)
 
 STRUCTURE = [(r"exchange[- ]traded debt", "BABY_BOND"),
              (r"third party trust preferred", "TP"),
@@ -59,7 +64,9 @@ STRUCTURE = [(r"exchange[- ]traded debt", "BABY_BOND"),
              (r"preferred|preference", "PREFERRED")]
 CPN_TYPE_TABLE = {"fixfloat": "FIX_TO_FLOAT", "fixed/adj": "RESET", "reset rate": "RESET",
                   "variable": "VARIABLE", "n.a.": ""}
-REF_RATE = [(r"(?:three[- ]month|3[- ]month|3-mo)\s+(?:term\s+)?sofr", "3M_TERM_SOFR"),
+REF_RATE = [(r"(?:three[- ]month|3[- ]month|3-mo)\s+term\s+sofr", "3M_TERM_SOFR"),
+            (r"\bterm\s+sofr\b", "3M_TERM_SOFR"),
+            (r"(?:three[- ]month|3[- ]month|3-mo)\s+sofr", "3M_SOFR"),
             (r"\bsofr\b", "SOFR"),
             (r"(?:three[- ]month|3[- ]month|3-mo)\s+libor", "3M_LIBOR"),
             (r"\blibor\b", "LIBOR"),
@@ -85,13 +92,113 @@ def security_block(text: str) -> tuple[str, str, str, list[str]]:
     if not dm:
         warn.append("no_description")
     tm = TABLE_RE.search(block)
-    return block, desc, (tm.group(1) if tm else ""), warn
+    tail = tm.group(1) if tm else ""
+    if tail:
+        te = TABLE_END.search(tail)
+        if te:
+            tail = tail[: te.start()]
+    return block, desc, tail, warn
+
+
+NAV_JUNK = re.compile(r"^(HOME|MARKETS|NEWS|LOGIN|INCOME|STOCK|SPECIAL|INFORMATION|"
+                      r"SERVICES|Hint:|by |Track all|AAPL stock|Session\.|"
+                      r"Glossary|Explanations of|Preferreds eligible|Securities |"
+                      r"Mandatory Convertible|Traditional |Trust Preferred|Third Party|"
+                      r"All Exchange|All Preferred|Municipal Bond|Convertible Debt|"
+                      r"QuantumOnline|Become a|List Descriptions|Table Descriptions|"
+                      r"IPOs? of|Banks List|Bank Holding|Real Estate Investment|"
+                      r"Closed-end|Exchange-Traded Funds|Master Limited|Royalty Trusts|"
+                      r"Business Development|Income Deposit|Special (?:Investment|Purpose)|"
+                      r"SIP-|U\.S\.|European|Asian|Cyrpto|Foreign Currency|Company |"
+                      r"Dividend Reports|Earnings Release|Initial Public|Major Shareholder|"
+                      r"Mergers and|Stock Market|Forbes|Email Alert|Find a problem|"
+                      r"Have you filled|Copyright|FYI, |Some users|Yahoo\.com|The Square|"
+                      r"Square\.com|Users can|We have|There (?:is|are)|The QuantumOnline|"
+                      r"We apologize|Tips on|What Income|Income Investing|Privacy Policy|"
+                      r"About QOL|QOL SUPPORT|CONTACT|GUESTBOOK|USING QOL|LINKS|ABOUT)", re.I)
+
+
+def security_name(text: str) -> str:
+    """The security's full name is the last real line ABOVE the ticker line.
+
+    It is not necessarily the immediately preceding line -- QOL emits several
+    blank rows between them -- so scan back rather than anchoring on \n.
+    The name matters beyond cosmetics: it carries the exact coupon (the summary
+    table rounds 6.375% to 6.38) and it is the only place "Convertible" appears
+    reliably.
+    """
+    m = re.search(r"^Ticker Symbol:", text, re.M) or re.search(r"Ticker Symbol:", text)
+    if not m:
+        return ""
+    seen = 0
+    for line in reversed(text[: m.start()].split("\n")):
+        t = line.strip()
+        if len(t) < 8 or t == "-->":
+            continue                       # blank rows and stray comment closers
+        seen += 1
+        if seen > 30:
+            break                          # do not wander up into the menus
+        if NAV_JUNK.match(t) or t.endswith(":"):
+            continue
+        return t
+    return ""
+
+
+DATEISH = re.compile(r"^(\d{1,2}/\d{1,2}/\d{2,4}|None|n\.a\.|NONE)$", re.I)
+MONEYISH = re.compile(r"^\$?\s*[\d,]+(?:\.\d+)?$")
+DIST_SHAPE = re.compile(r"\d{1,2}/\d{1,2}\s*[,&]|Last business day|First Day|"
+                        r"Monthly|Quarterly|Semi-?annual", re.I)
 
 
 def table_values(tail: str) -> list[str]:
-    """The 14 summary values, in page order, blank lines dropped."""
+    """Summary-table values, boilerplate removed.
+
+    "Chart" is present only when the security still charts, so a delisted name
+    has one fewer value -- which is why this is parsed by SHAPE below rather
+    than by position.
+    """
     vals = [ln.strip() for ln in tail.split("\n") if ln.strip()]
-    return [v for v in vals if not v.startswith("Click for")][:13]
+    return [v for v in vals
+            if not v.startswith("Click for") and v not in ("Chart", "Stock", "Exchange")]
+
+
+def parse_table(vals: list[str]) -> dict:
+    """Pull the summary table by value shape, not index.
+
+    Two things break positional parsing, and both are common:
+      - "Chart" is absent for delisted securities
+      - the Moody's/S&P cell renders as one line ("NR NR") or two ("NR", "BBB")
+    So: take the Yes/No tax rate off the end, the exchange off the front, lift
+    the distribution schedule out by its shape, then read the remainder as
+    coupon -> three amounts -> two dates -> ratings -> as-of date.
+    """
+    v = list(vals)
+    out = {}
+    for i in range(len(v) - 1, -1, -1):
+        if re.match(r"^(Yes|No)\b", v[i], re.I):
+            out["tax"] = v[i]
+            del v[i]
+            break
+    if v and re.fullmatch(r"[A-Za-z.]{2,10}", v[0]):
+        out["exchange"] = v.pop(0)
+    for i, x in enumerate(v):
+        if DIST_SHAPE.search(x):
+            out["dist"] = x
+            del v[i]
+            break
+    if v:
+        out["cpn"] = v.pop(0)
+    for key in ("ann", "liq", "callpx"):
+        if v and MONEYISH.match(v[0]):
+            out[key] = v.pop(0)
+    for key in ("calldt", "matdt"):
+        if v and DATEISH.match(v[0]):
+            out[key] = v.pop(0)
+    if v and DATEISH.match(v[-1]):
+        out["asof"] = v.pop()
+    if v:
+        out["ratings"] = " ".join(v)
+    return out
 
 
 def rx(pat, text, group=1, flags=re.I):
@@ -138,7 +245,7 @@ def parse_one(rec: dict) -> dict:
         return out
     tv = table_values(tail)
 
-    out["security_name"] = rx(r"^(.{8,140})\nTicker Symbol:", block, flags=re.M) or ""
+    out["security_name"] = security_name(text)
     out["cusip"] = rx(r"CUSIP:\s*([A-Z0-9]{6,12})", block) or ""
     out["exchange"] = rx(r"Exchange:\s*([A-Za-z.]{2,10})", block) or (tv[0] if tv else "")
     out["security_type"] = rx(r"Security Type:\s*\n?\s*([^\n]{3,80})", block) or ""
@@ -146,34 +253,32 @@ def parse_one(rec: dict) -> dict:
     out["previous_ticker"] = rx(r"Previous Ticker Symbol:\s*([A-Z0-9.\-]{1,10})", block) or ""
     out["previous_ticker_changed"] = rx(r"Previous Ticker Symbol:[^\n]*?Changed:\s*([\d/]{6,10})", block) or ""
 
-    # --- summary table (positional) -------------------------------------
-    if len(tv) >= 12:
-        cpn_raw, ann, liq, callpx, calldt, matdt, rating, asof, dist = tv[2:11]
-        out["annual_amount"] = num(ann) or ""
-        out["par"] = num(liq) or ""
-        out["call_price"] = num(callpx) or ""
-        out["call_date"] = "" if calldt.lower() in ("none", "n.a.", "") else calldt
-        out["maturity_date"] = "" if matdt.lower() in ("none", "n.a.", "") else matdt
-        out["ratings"] = rating if rating.lower() not in ("none", "n.a.") else ""
-        out["qol_as_of"] = asof
-        out["distribution_dates"] = dist
-        tax = tv[11] if len(tv) > 11 else ""
-        if tax.strip().lower().startswith("yes"):
-            out["qdi_eligible"] = True
-        elif tax.strip().lower().startswith("no"):
-            out["qdi_eligible"] = False
-        else:
-            flags.append("qdi_eligible")
-        ct = CPN_TYPE_TABLE.get(cpn_raw.strip().lower())
-        if ct is not None:
-            out["coupon_type"] = ct
-        elif num(cpn_raw) is not None:
-            out["coupon_type"] = "FIXED"
-            out["coupon_pct"] = num(cpn_raw)
-        else:
-            flags.append("coupon_type_from_table")
-    else:
+    # --- summary table (by shape, see parse_table) ------------------------
+    out["qol_table_raw"] = " | ".join(tv)
+    t = parse_table(tv)
+    if not t:
         flags.append("summary_table")
+    out["exchange"] = out["exchange"] or t.get("exchange", "")
+    out["annual_amount"] = num(t.get("ann")) or ""
+    out["par"] = num(t.get("liq")) or ""
+    out["call_price"] = num(t.get("callpx")) or ""
+    cd, md = t.get("calldt", ""), t.get("matdt", "")
+    out["call_date"] = "" if cd.lower() in ("none", "n.a.", "") else cd
+    out["maturity_date"] = "" if md.lower() in ("none", "n.a.", "") else md
+    out["ratings"] = t.get("ratings", "")
+    out["qol_as_of"] = t.get("asof", "")
+    out["distribution_dates"] = t.get("dist", "")
+    tax = t.get("tax", "")
+    if tax.lower().startswith("yes"):
+        out["qdi_eligible"] = True
+    elif tax.lower().startswith("no"):
+        out["qdi_eligible"] = False
+    else:
+        flags.append("qdi_eligible")
+    cpn_raw = t.get("cpn", "")
+    ct = CPN_TYPE_TABLE.get(cpn_raw.strip().lower())
+    if ct:
+        out["coupon_type"] = ct
 
     # --- prose-only facts ------------------------------------------------
     if re.search(r"non-?cumulative", desc, re.I):
@@ -185,12 +290,16 @@ def parse_one(rec: dict) -> dict:
     else:
         flags.append("cumulative")
 
-    # coupon: the security NAME carries the fixed rate even when the table says FixFloat
-    if out["coupon_pct"] == "":
-        c = (rx(r"(\d{1,2}\.\d{1,4})\s*%", out["security_name"] or "")
-             or rx(r"(\d{1,2})%", out["security_name"] or "")
-             or rx(r"(?:distributions|interest|dividends) of\s+(\d{1,2}\.?\d{0,4})\s*%", desc))
-        out["coupon_pct"] = num(c) or ""
+    # Coupon, most precise source first. The summary table ROUNDS (6.375 -> 6.38),
+    # so it is the last resort, never the first.
+    c = (rx(r"(\d{1,2}\.\d{1,4})\s*%", out["security_name"] or "")
+         or rx(r"(\d{1,2})\s*%", out["security_name"] or "")
+         or rx(r"(?:distributions|interest|dividends) of\s+(\d{1,2}\.?\d{0,4})\s*%", desc))
+    out["coupon_pct"] = num(c) or ""
+    if out["coupon_pct"] == "" and out["annual_amount"] != "" and out["par"] not in ("", 0):
+        out["coupon_pct"] = round(out["annual_amount"] / out["par"] * 100, 4)
+    if out["coupon_pct"] == "" and num(cpn_raw) is not None:
+        out["coupon_pct"] = num(cpn_raw)
     if out["coupon_pct"] == "":
         flags.append("coupon_pct")
     if out["par"] == "":
@@ -204,8 +313,13 @@ def parse_one(rec: dict) -> dict:
         out["call_date"] = (rx(r"redeemable[^.]{0,160}?on or after\s+([\d/]{6,10})", desc)
                             or ("any time" if re.search(r"redeemable[^.]{0,80}at any time", desc, re.I) else ""))
 
-    if out["coupon_type"] in ("FIX_TO_FLOAT", "FLOATER", "RESET", "VARIABLE") or \
-       re.search(r"floating rate|will (?:be|float)", desc, re.I):
+    # Gate on the table's coupon type, or an explicit float sentence. NOT on the
+    # bare word "floating": every fixed-rate description mentions a floating rate
+    # in its change-of-control language, and "will be paid quarterly" also matched
+    # an earlier, sloppier pattern.
+    floats = re.search(r"at a floating rate|floating rate (?:of|equal to)|"
+                       r"rate will (?:be reset|float)|will be paid at a floating", desc, re.I)
+    if out["coupon_type"] in ("FIX_TO_FLOAT", "FLOATER", "RESET", "VARIABLE") or floats:
         if not out["coupon_type"]:
             out["coupon_type"] = "FIX_TO_FLOAT"
         out["reference_rate"] = pick(REF_RATE, desc, "") or ""
@@ -228,9 +342,12 @@ def parse_one(rec: dict) -> dict:
 
     out["currency"] = ("CAD" if re.search(r"canadian dollar|government of canada|"
                                           r"\bC\$", desc, re.I) else "USD")
+    # The delisting/redemption sentence often sits in a NOTE outside the
+    # description paragraph, so scan the whole block. Safe: the block excludes nav.
     out["redeemed"] = bool(re.search(r"has been (?:redeemed|called for redemption)|"
                                      r"been fully redeemed|no longer trading|"
-                                     r"has been delisted", desc, re.I))
+                                     r"has been delisted|called for redemption",
+                                     block, re.I))
     out["parse_flags"] = ";".join(dict.fromkeys(flags))
     return out
 
