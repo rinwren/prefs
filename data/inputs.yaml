@@ -1,0 +1,59 @@
+# Master inputs. Everything tunable lives here and nowhere else.
+# Edit a value, re-run scripts/calc.py, and every derived number moves.
+
+rates:
+  # Pulled by scripts/fetch_rates.py into data/rates.json; these are fallbacks
+  # used only if the fetch fails.
+  treasury_tenor: "10 Yr"
+  treasury_fallback: 0.0400
+  sofr_fallback: 0.0363          # verified 2026-08-20 via NY Fed API
+
+required_yield:
+  qdi_switch: -1                 # sign on the QDI adjustment; -1 = QDI lowers required yield
+  qdi_adjustment: 0.05           # relative: base * this * switch. 5% of base, not 5 points.
+
+  # Replaces the nested IFs. Add keys freely; an unlisted value contributes 0.
+  structure_adjustment:
+    PREFERRED:  0.0
+    BABY_BOND: -0.005            # was "debt" -0.50%; a competing scheme used -0.75%
+    TRUPS:     -0.005
+    TP:        -0.005
+    UNIT:       0.0
+
+  # New axis, separated out of the old single "type" column. All zero until you decide.
+  coupon_type_adjustment:
+    FIXED:         0.0
+    FIX_TO_FLOAT:  0.0
+    FLOATER:       0.0
+    RESET:         0.0
+    VARIABLE:      0.0
+    CONVERTIBLE:   0.0
+    MAND_CONVERT:  0.0
+
+# Base required yield keyed off PARENT MARKET CAP.
+# Replaces the old parent-PRICE ladder (<=$10 -> 10%, 10-15 -> 9%, 15-20 -> 8.5%, >20 -> 8%),
+# which used price as a proxy for size and broke entirely whenever the parent did not quote.
+# Rung applies to market caps strictly below upper_bound_mm. Add rungs freely.
+base_yield_ladder:
+  - {upper_bound_mm:      250, base_yield: 0.100}
+  - {upper_bound_mm:     1000, base_yield: 0.090}
+  - {upper_bound_mm:     5000, base_yield: 0.085}
+  - {upper_bound_mm:    20000, base_yield: 0.080}
+  - {upper_bound_mm: 99999999, base_yield: 0.075}
+
+market_cap:
+  # Market cap moves daily; a parent sitting near a rung boundary would otherwise
+  # flip its whole block's base yield back and forth. Snapshot monthly instead.
+  refresh: monthly
+
+flags:
+  # Display-only. Cumulative is a positive marker when reading a name, NOT an
+  # adjustment -- confirmed with R, 2026-08-21.
+  display_only: [cumulative, convertible]
+  # Discount-to-normal stops being meaningful once a security trades at a deep
+  # discount to par; bucket those rather than letting them top the sort.
+  distress_price_pct_of_par: 0.60
+
+staleness:
+  price_max_age_days: 4
+  facts_max_age_days: 45
